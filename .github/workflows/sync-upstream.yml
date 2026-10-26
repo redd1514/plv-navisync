@@ -1,0 +1,53 @@
+name: Sync upstream main
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-main:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify fork upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          parent_full_name="$(gh api "/repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // ""')"
+          if [[ -z "${parent_full_name}" ]]; then
+            echo "::error::${GITHUB_REPOSITORY} is not configured as a fork."
+            exit 1
+          fi
+          if [[ "${parent_full_name}" != "nitsuwa/plv-navisync" ]]; then
+            echo "::error::Expected upstream nitsuwa/plv-navisync, found ${parent_full_name}."
+            exit 1
+          fi
+
+      - name: Sync fork main from upstream main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # This uses GitHub's native fork synchronization behavior.
+          # It will fail instead of force-overwriting if histories diverge or protections block updates.
+          result="$(gh api --method POST \
+            "/repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch='main')"
+
+          message="$(jq -r '.message // ""' <<<"${result}")"
+          merge_type="$(jq -r '.merge_type // ""' <<<"${result}")"
+
+          if [[ "${message}" == *"not behind upstream"* ]] || [[ "${message}" == *"up to date"* ]]; then
+            echo "No changes to sync: ${message}"
+          elif [[ -n "${merge_type}" ]]; then
+            echo "Synchronized upstream changes into main (merge_type=${merge_type})."
+          elif [[ -n "${message}" ]]; then
+            echo "Synchronization completed: ${message}"
+          else
+            echo "Synchronization completed."
+          fi
