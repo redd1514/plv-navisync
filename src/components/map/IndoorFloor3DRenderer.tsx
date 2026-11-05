@@ -14,10 +14,10 @@ import { exteriorStairVisualItem } from "../map-builder/ExteriorEmergencyFloorMo
 import type { Pt, RouteMode } from "../../lib/routePlanner";
 import type { StudentRouteExploreTransitionMarker } from "../../lib/studentRouteFlow";
 import { groupStudentRouteExploreTransitions } from "../../lib/studentRouteFlow";
-import { shouldPreserveStudent3dFollowCameraOffset, student3dFollowCameraOffsetForRecovery, student3dFollowCameraOrientationChanged, type Student3dCameraOffset, type Student3dCameraPose } from "../../lib/student3dCameraPose";
+import { shouldPreserveStudent3dFollowCameraOffset, student3dFollowCameraOffsetForRecovery, student3dFollowCameraOffsetChanged, synchronizeStudent3dFollowCameraOffsetDistance, type Student3dCameraOffset, type Student3dCameraPose } from "../../lib/student3dCameraPose";
 import { StudentExploreTransitionChoiceControl } from "./StudentExploreTransitionChoiceControl";
 import { IskolarWalker3D } from "./IskolarWalker3D";
-import { createRoutePointSampler, createRouteWorldSampler, routeArrowPlacements } from "../../lib/studentRoute3dPresentation";
+import { createRoutePointSampler, createRouteWorldSampler, routeArrowDistanceAt, routeArrowPlacements, routePolylineWorldLength, routeVisualProgressWithEndpointClearance, STUDENT_FLOOR_3D_SCALE } from "../../lib/studentRoute3dPresentation";
 import { clampStudent3dCameraTarget, configureStudent3dInputMappings, shouldPauseFollowForManualCameraGesture, shouldPreventStudent3dContextMenu, student3dCameraGesture, student3dTouchGestureMotion, translateStudent3dFollowCamera, type Student3dCameraTargetBounds, type Student3dTouchPoint } from "../../lib/student3dInput";
 import { student3dFocusDistance, student3dFocusDistanceForViewport, student3dIndoorArrivalCameraDirection, student3dIndoorFollowCameraOffset, student3dSafeFocusRect } from "../../lib/student3dCameraFocus";
 import { student3dCameraRecenterNonceToHandle } from "../../lib/student3dCameraRecenter";
@@ -104,7 +104,7 @@ type StairVisualItem = Pick<FloorStairs, "id" | "x" | "y" | "width" | "height" |
 };
 type RampVisualItem = NonNullable<FloorPlan["ramps"]>[number] | NonNullable<FloorPlan["entranceRamps"]>[number];
 
-const FLOOR_SCALE = 0.025;
+const FLOOR_SCALE = STUDENT_FLOOR_3D_SCALE;
 const STUDENT_ROUTE_RIBBON_WIDTH = 0.12;
 const WALL_HEIGHT = 2.9;
 const FLOOR_SURFACE_Y = 0.012;
@@ -724,25 +724,26 @@ function IndoorRouteArrows({ arrows, points, viewport, ramps, reducedMotion = fa
   useFrame((_, delta) => {
     const mesh = meshRef.current;
     if (!mesh || reducedMotion || !animate || arrows.length === 0) return;
-    const usable = sampler.totalLength - 1.8;
-    if (usable <= 0) return;
     elapsedRef.current += Math.min(delta, 0.05);
-    const spacing = usable / arrows.length;
-    const phase = (elapsedRef.current * 0.3) % spacing;
     for (let index = 0; index < arrows.length; index += 1) {
-      const distance = 0.9 + ((index * spacing + phase) % usable);
+      const distance = routeArrowDistanceAt(sampler.totalLength, arrows.length, index, elapsedRef.current, 0.3);
+      if (distance === null) continue;
       const point = sampler.sample(distance, pointScratch);
       if (!point) continue;
       transform.position.set(...pointToWorld(point, viewport, 0.1 + rampHeightAt(point, ramps)));
       transform.rotation.set(0, sampler.yawAt(distance), 0);
-      transform.scale.setScalar(sampler.isNearCorner(distance) ? 0 : 1);
+      // Keep the same smoothed corner traversal as outdoor routes. Hiding an
+      // arrow near each corner creates visible gaps on short indoor routes.
+      transform.scale.setScalar(1);
       transform.updateMatrix();
       mesh.setMatrixAt(index, transform.matrix);
     }
     mesh.instanceMatrix.needsUpdate = true;
   });
   if (!arrows.length) return null;
-  return <instancedMesh ref={meshRef} args={[geometry, material, arrows.length]} renderOrder={11} frustumCulled />;
+  // Instances circulate across the full route; the initial sphere is stale
+  // as soon as arrows begin moving and can otherwise cull the whole batch.
+  return <instancedMesh ref={meshRef} args={[geometry, material, arrows.length]} renderOrder={11} frustumCulled={false} />;
 }
 
 function ChairGeometry({ width, depth, color, tablet = false }: { width: number; depth: number; color: string; tablet?: boolean }) {
@@ -1771,6 +1772,7 @@ function FloorScene(props: IndoorFloor3DRendererProps & {
   const route = props.routePoints ?? EMPTY_FLOOR_ROUTE;
   const followCameraRouteKey = props.followCameraRouteKey ?? route;
   const sampleRoute = useMemo(() => createRoutePointSampler(route), [route]);
+  const routeLengthWorld = useMemo(() => routePolylineWorldLength(route, FLOOR_SCALE), [route]);
   const routeForFrame = useMemo(() => props.emergencyRouteOverview && props.emergencyRouteSegments?.length
     ? props.emergencyRouteSegments.flatMap((segment) => segment.points)
     : route, [props.emergencyRouteOverview, props.emergencyRouteSegments, route]);
@@ -1855,8 +1857,11 @@ function FloorScene(props: IndoorFloor3DRendererProps & {
     ...descendingStairOpenings.filter((polygon) => polygon.every((point) => pointInPolygon(point, points))),
   ]), [descendingStairOpenings, nestedRoomPolygons, rooms]);
   const visualWalkProgress = props.walkProgressRef?.current ?? props.walkProgress;
+  const adjustedVisualWalkProgress = visualWalkProgress === undefined
+    ? undefined
+    : routeVisualProgressWithEndpointClearance(visualWalkProgress, routeLengthWorld);
   const humanPoint = props.humanVisible && visualWalkProgress !== undefined
-    ? sampleRoute(visualWalkProgress, routeSamplePointRef.current)
+    ? sampleRoute(adjustedVisualWalkProgress!, routeSamplePointRef.current)
     : props.walkProgress === undefined ? null : sampleRoute(props.walkProgress, routeSamplePointRef.current);
   const humanRampHeight = humanPoint ? rampHeightAt(humanPoint, ramps) : 0;
     const cutawayFocus = props.arrivalFocusPoint ?? humanPoint ?? route.at(-1) ?? null;
@@ -2039,7 +2044,7 @@ function FloorScene(props: IndoorFloor3DRendererProps & {
     if (props.focusRoomId && !(props.followMode && !props.freeLook)) return;
     const progress = props.walkProgressRef?.current ?? props.walkProgress;
     const followPoint = props.followMode && !props.freeLook && props.humanVisible && progress !== undefined
-      ? sampleRoute(progress, routeSamplePointRef.current)
+      ? sampleRoute(routeVisualProgressWithEndpointClearance(progress, routeLengthWorld), routeSamplePointRef.current)
       : null;
     // A manual pan during Follow switches the renderer to free-look. Keep the
     // camera exactly where the user placed it instead of fitting the floor as
@@ -2187,7 +2192,7 @@ function FloorScene(props: IndoorFloor3DRendererProps & {
     camera.lookAt(nextTarget);
     camera.updateProjectionMatrix();
     invalidate();
-  }, [camera, cameraDirection, cameraTargetBounds, cancelRecenterTween, floor.id, floorCameraContextKey, floorFocusBounds, frameCenter, halfDepth, invalidate, props.arrivalFocusKey, props.discoverCamera, props.focusRoomId, props.followMode, props.freeLook, props.humanVisible, props.routePreviewFocusKey, props.walkProgress, props.walkProgressRef, ramps, sampleRoute, size.width, viewport]);
+  }, [camera, cameraDirection, cameraTargetBounds, cancelRecenterTween, floor.id, floorCameraContextKey, floorFocusBounds, frameCenter, halfDepth, invalidate, props.arrivalFocusKey, props.discoverCamera, props.focusRoomId, props.followMode, props.freeLook, props.humanVisible, props.routePreviewFocusKey, props.walkProgress, props.walkProgressRef, ramps, routeLengthWorld, sampleRoute, size.width, viewport]);
 
   useEffect(() => {
     // Follow takes camera ownership back when the canonical session is
@@ -2243,7 +2248,7 @@ function FloorScene(props: IndoorFloor3DRendererProps & {
   useFrame((_, delta) => {
     const progress = props.walkProgressRef?.current ?? props.walkProgress;
     const livePoint = props.humanVisible && progress !== undefined
-      ? sampleRoute(progress, routeSamplePointRef.current)
+      ? sampleRoute(routeVisualProgressWithEndpointClearance(progress, routeLengthWorld), routeSamplePointRef.current)
       : humanPoint;
     if (humanMarkerRef.current) {
       if (props.humanVisible && livePoint) {
@@ -2300,8 +2305,8 @@ function FloorScene(props: IndoorFloor3DRendererProps & {
           : null;
         if (routeOffset) {
           const nextOffset = followOrientationTargetRef.current ?? new THREE.Vector3();
-          const orientationChanged = student3dFollowCameraOrientationChanged(nextOffset, routeOffset);
-          if (orientationChanged) {
+          const offsetChanged = student3dFollowCameraOffsetChanged(nextOffset, routeOffset);
+          if (offsetChanged) {
             nextOffset.set(routeOffset.x, routeOffset.y, routeOffset.z);
             followOrientationTargetRef.current = nextOffset;
           }
@@ -2309,6 +2314,11 @@ function FloorScene(props: IndoorFloor3DRendererProps & {
       }
       const orientationTarget = followOrientationTargetRef.current;
       if (orientationTarget) {
+        // OrbitControls applies wheel and pinch dolly directly to the camera.
+        // Carry that live distance into the smoothed Follow offset so its next
+        // frame cannot pull the camera back to the previous zoom level.
+        const liveDistance = camera.position.distanceTo(controlsTarget);
+        synchronizeStudent3dFollowCameraOffsetDistance(orientationTarget, liveDistance);
         const currentOffset = followOrientationCurrentRef.current.copy(camera.position).sub(controlsTarget);
         const blend = props.reducedMotion ? 1 : 1 - Math.exp(-safeDelta * 3.2);
         currentOffset.lerp(orientationTarget, blend);
@@ -2656,7 +2666,7 @@ function FloorScene(props: IndoorFloor3DRendererProps & {
           ?? props.routeColor
           ?? (props.routeMode === "emergency" ? "#dc2626" : props.routeMode === "accessible" ? "#16a34a" : "#1769e0")}
           emissive={props.routeMode === "emergency" ? "#7f1d1d" : props.routeMode === "accessible" ? "#14532d" : "#0b4eb3"}
-          emissiveIntensity={0.17} side={THREE.DoubleSide} />
+          emissiveIntensity={0.17} side={THREE.DoubleSide} depthWrite={false} />
       </mesh>}
       {visibleRoute && !props.emergencyRouteOverview && <IndoorRouteArrows arrows={routeArrows} points={route} viewport={viewport} ramps={ramps} reducedMotion={props.reducedMotion} animate={props.animateRouteArrows} />}
       {emergencyRouteModels.map((model) => <Fragment key={`emergency-route-${model.id}`}>
